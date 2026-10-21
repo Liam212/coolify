@@ -104,6 +104,35 @@ class GithubRunnerApi
         }
     }
 
+    /** @return array<string, mixed> */
+    public function workflowJob(string $repositoryFullName, int $jobId): array
+    {
+        $repository = implode('/', array_map('rawurlencode', explode('/', $repositoryFullName, 2)));
+        $response = $this->client()->connectTimeout(3)->timeout(5)->get("/repos/{$repository}/actions/jobs/{$jobId}");
+        $job = $response->json();
+        if (! $response->successful() || ! is_array($job) || ($job['id'] ?? null) !== $jobId
+            || ! in_array($job['status'] ?? null, ['queued', 'in_progress', 'completed', 'waiting', 'pending', 'requested'], true)
+            || (($job['status'] ?? null) === 'completed' && (! is_string($job['conclusion'] ?? null) || $job['conclusion'] === '' || mb_strlen($job['conclusion']) > 255))) {
+            throw new RuntimeException('Could not verify the workflow job status.');
+        }
+
+        return $job;
+    }
+
+    /** @return array{id: int, busy: bool}|null */
+    public function runner(int $runnerId): ?array
+    {
+        $response = $this->client()->connectTimeout(3)->timeout(5)->get("/orgs/{$this->organization()}/actions/runners/{$runnerId}");
+        if ($response->status() === 404) {
+            return null;
+        }
+        if (! $response->successful() || $response->json('id') !== $runnerId || ! is_bool($response->json('busy'))) {
+            throw new RuntimeException('Could not verify whether the runner is busy.');
+        }
+
+        return ['id' => $runnerId, 'busy' => $response->json('busy')];
+    }
+
     private function client(): PendingRequest
     {
         return Http::GitHub($this->githubApp->api_url, generateGithubInstallationToken($this->githubApp))->timeout(30);
