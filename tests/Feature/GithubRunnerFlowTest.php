@@ -10,7 +10,6 @@ use App\Models\GithubApp;
 use App\Models\GithubRunnerConfig;
 use App\Models\GithubRunnerExecution;
 use App\Models\InstanceSettings;
-use App\Models\PrivateKey;
 use App\Models\Server;
 use App\Models\Team;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -35,68 +34,7 @@ afterEach(function () {
     Server::flushIdentityMap();
 });
 
-function runnerTestGithubApp(Team $team, int $appId, string $secret): GithubApp
-{
-    $rsaKey = openssl_pkey_new(['private_key_bits' => 2048, 'private_key_type' => OPENSSL_KEYTYPE_RSA]);
-    openssl_pkey_export($rsaKey, $pemKey);
-    $privateKey = PrivateKey::create(['name' => 'Runner key', 'private_key' => $pemKey, 'team_id' => $team->id]);
-
-    return GithubApp::create([
-        'name' => "runner-app-{$appId}",
-        'organization' => 'acme',
-        'api_url' => 'https://api.github.com',
-        'html_url' => 'https://github.com',
-        'custom_user' => 'git',
-        'custom_port' => 22,
-        'app_id' => $appId,
-        'installation_id' => $appId + 1,
-        'webhook_secret' => $secret,
-        'private_key_id' => $privateKey->id,
-        'team_id' => $team->id,
-        'is_system_wide' => false,
-        'runner_group_id' => 7,
-    ]);
-}
-
-function runnerTestServer(Team $team, string $role = 'build'): Server
-{
-    $server = Server::factory()->create(['team_id' => $team->id]);
-    $server->settings()->update([
-        'is_reachable' => true,
-        'is_usable' => true,
-        'server_role' => $role,
-        'is_build_server' => $role === 'build',
-        'force_disabled' => false,
-    ]);
-
-    return $server->fresh();
-}
-
-function runnerTestConfig(Server $server, GithubApp $githubApp, array $attributes = []): GithubRunnerConfig
-{
-    return GithubRunnerConfig::create([
-        'server_id' => $server->id,
-        'github_app_id' => $githubApp->id,
-        'labels' => ['coolify'],
-        'max_runners' => 2,
-        'docker_mode' => 'dind',
-        ...$attributes,
-    ]);
-}
-
-function runnerTestExecution(GithubApp $githubApp, array $attributes = []): GithubRunnerExecution
-{
-    static $jobId = 1000;
-
-    return GithubRunnerExecution::create([
-        'github_app_id' => $githubApp->id,
-        'trigger_workflow_job_id' => ++$jobId,
-        'labels' => ['self-hosted', 'coolify'],
-        'status' => GithubRunnerStatus::Queued,
-        'queued_at' => now(),
-        ...$attributes,
-    ]);
-}
+require_once __DIR__.'/../Support/GithubRunnerTestHelpers.php';
 
 function sendWorkflowJobWebhook($test, GithubApp $githubApp, string $secret, string $action, array $job, ?int $installationId = null)
 {
@@ -143,6 +81,17 @@ function fakeWorkflowRunApi(GithubApp $githubApp, mixed $runResponse): void
         'https://api.github.com/zen' => Http::response('ok', 200, ['Date' => now()->toRfc7231String()]),
         "https://api.github.com/app/installations/{$githubApp->installation_id}/access_tokens" => Http::response(['token' => 'installation-token'], 201),
         'https://api.github.com/repos/acme/api/actions/runs/321' => $runResponse,
+    ]);
+}
+
+function fakeRunnerStatusApi(GithubApp $githubApp, mixed $jobResponse, mixed $runnerResponse = null): void
+{
+    Http::preventStrayRequests();
+    Http::fake([
+        'https://api.github.com/zen' => Http::response('ok', 200, ['Date' => now()->toRfc7231String()]),
+        "https://api.github.com/app/installations/{$githubApp->installation_id}/access_tokens" => Http::response(['token' => 'installation-token'], 201),
+        'https://api.github.com/repos/acme/api/actions/jobs/5001' => $jobResponse,
+        'https://api.github.com/orgs/acme/actions/runners/42' => $runnerResponse ?? Http::response(['id' => 42, 'busy' => false]),
     ]);
 }
 
@@ -354,12 +303,15 @@ describe('workflow_job webhook', function () {
         Queue::assertPushed(ProvisionGithubRunnerJob::class, 1);
     });
 
-    it('does not start a new runner when the runner took another job with its own pending runner', function () {
+    it('requeues the original job when its runner takes another unassigned queued job', function () {
         $first = runnerTestExecution($this->githubApp, [
             'trigger_workflow_job_id' => 5001,
             'status' => GithubRunnerStatus::Idle,
             'server_id' => $this->server->id,
             'runner_name' => 'coolify-runner-a',
+            'job_name' => 'original-build',
+            'repository_full_name' => 'acme/original',
+            'provision_attempts' => 1,
         ]);
         $second = runnerTestExecution($this->githubApp, ['trigger_workflow_job_id' => 6001]);
 
@@ -370,9 +322,15 @@ describe('workflow_job webhook', function () {
 
         expect(GithubRunnerExecution::count())->toBe(2)
             ->and($first->fresh()->status)->toBe(GithubRunnerStatus::Running)
+            ->and($first->fresh()->trigger_workflow_job_id)->toBe(6001)
             ->and($first->fresh()->workflow_job_id)->toBe(6001)
-            ->and($second->fresh()->status)->toBe(GithubRunnerStatus::Queued);
-        Queue::assertNotPushed(ProvisionGithubRunnerJob::class);
+            ->and($second->fresh())->toBeNull();
+        $replacement = GithubRunnerExecution::where('trigger_workflow_job_id', 5001)->sole();
+        expect($replacement->status)->toBe(GithubRunnerStatus::Queued)
+            ->and($replacement->workflow_job_id)->toBe(5001)
+            ->and($replacement->job_name)->toBe('original-build')
+            ->and($replacement->repository_full_name)->toBe('acme/original');
+        Queue::assertPushed(ProvisionGithubRunnerJob::class, fn ($job) => $job->executionId === $replacement->id);
     });
 
     it('does not start a new runner for a job whose runner was taken', function (Closure $setup, array $attributes) {
@@ -399,6 +357,27 @@ describe('workflow_job webhook', function () {
         'configuration disabled' => [fn () => GithubRunnerConfig::query()->update(['is_enabled' => false]), []],
         'pull request job no longer allowed' => [fn () => null, ['is_pull_request' => true]],
     ]);
+
+    it('preserves the other runner when cross-assignment happens after it has been allocated', function (GithubRunnerStatus $status) {
+        $first = runnerTestExecution($this->githubApp, [
+            'trigger_workflow_job_id' => 5001, 'status' => GithubRunnerStatus::Idle,
+            'server_id' => $this->server->id, 'runner_name' => 'coolify-runner-a',
+        ]);
+        $second = runnerTestExecution($this->githubApp, [
+            'trigger_workflow_job_id' => 6001, 'status' => $status,
+            'server_id' => $this->server->id, 'runner_name' => 'coolify-runner-b',
+        ]);
+
+        sendWorkflowJobWebhook($this, $this->githubApp, 'runner-secret', 'in_progress', ['id' => 6001, 'runner_name' => $first->runner_name])->assertOk();
+        sendWorkflowJobWebhook($this, $this->githubApp, 'runner-secret', 'in_progress', ['id' => 5001, 'runner_name' => $second->runner_name])->assertOk();
+
+        expect($first->fresh()->workflow_job_id)->toBe(6001)
+            ->and($first->fresh()->status)->toBe(GithubRunnerStatus::Running)
+            ->and($second->fresh()->workflow_job_id)->toBe(5001)
+            ->and($second->fresh()->status)->toBe(GithubRunnerStatus::Running)
+            ->and(GithubRunnerExecution::count())->toBe(2);
+        Queue::assertNothingPushed();
+    })->with([GithubRunnerStatus::Provisioning, GithubRunnerStatus::Idle]);
 
     it('marks the runner running without a new runner when it took the job it was started for', function () {
         $execution = runnerTestExecution($this->githubApp, [
@@ -462,7 +441,7 @@ describe('workflow_job webhook', function () {
         expect($execution->fresh()->status)->toBe(GithubRunnerStatus::Cancelled);
     });
 
-    it('keeps the queued execution when its job ran on a Coolify runner started for another job', function () {
+    it('retires an unassigned duplicate when its job finishes on another Coolify runner', function () {
         $queued = runnerTestExecution($this->githubApp, ['trigger_workflow_job_id' => 5001]);
         runnerTestExecution($this->githubApp, [
             'status' => GithubRunnerStatus::Running,
@@ -475,11 +454,42 @@ describe('workflow_job webhook', function () {
             'conclusion' => 'success',
         ])->assertOk();
 
-        expect($queued->fresh()->status)->toBe(GithubRunnerStatus::Queued);
+        expect($queued->fresh()->status)->toBe(GithubRunnerStatus::Completed)
+            ->and($queued->fresh()->conclusion)->toBe('success')
+            ->and($queued->fresh()->server_id)->toBeNull();
     });
 });
 
 describe('provisioning', function () {
+    it('does not provision an unassigned job that GitHub already dispatched or completed', function (string $status) {
+        Queue::fake();
+        Process::fake();
+        $server = runnerTestServer($this->team);
+        runnerTestConfig($server, $this->githubApp);
+        $execution = runnerTestExecution($this->githubApp, ['trigger_workflow_job_id' => 5001, 'repository_full_name' => 'acme/api']);
+        fakeRunnerStatusApi($this->githubApp, Http::response(['id' => 5001, 'status' => $status, 'conclusion' => $status === 'completed' ? 'success' : null]));
+
+        (new ProvisionGithubRunnerJob($execution->id))->handle();
+
+        expect($execution->fresh()->status)->toBe($status === 'completed' ? GithubRunnerStatus::Completed : GithubRunnerStatus::Cancelled)
+            ->and($execution->fresh()->server_id)->toBeNull();
+        Process::assertNothingRan();
+    })->with(['completed', 'in_progress']);
+
+    it('keeps an unassigned job queued when its GitHub status cannot be verified', function () {
+        Queue::fake();
+        Process::fake();
+        $server = runnerTestServer($this->team);
+        runnerTestConfig($server, $this->githubApp);
+        $execution = runnerTestExecution($this->githubApp, ['trigger_workflow_job_id' => 5001, 'repository_full_name' => 'acme/api']);
+        fakeRunnerStatusApi($this->githubApp, Http::response(['message' => 'Unavailable'], 503));
+
+        (new ProvisionGithubRunnerJob($execution->id))->handle();
+
+        expect($execution->fresh()->status)->toBe(GithubRunnerStatus::Queued)
+            ->and($execution->fresh()->server_id)->toBeNull();
+        Process::assertNothingRan();
+    });
     it('starts a runner on the least busy matching server that can build', function () {
         Queue::fake();
         fakeRunnerGithubApi($this->githubApp);
@@ -831,6 +841,201 @@ describe('cleanup and reconciliation', function () {
         $execution->refresh();
         expect($execution->status)->toBe(GithubRunnerStatus::Completed)
             ->and($execution->error_message)->toBeNull();
+    });
+
+    it('uses GitHub completion instead of guessing failure from a stopped runner', function () {
+        Queue::fake();
+        Process::fake(['*' => Process::result(output: '')]);
+        $execution = runnerTestExecution($this->githubApp, [
+            'trigger_workflow_job_id' => 5001, 'workflow_job_id' => 5001, 'repository_full_name' => 'acme/api',
+            'status' => GithubRunnerStatus::Running, 'server_id' => $this->server->id,
+            'github_runner_config_id' => $this->config->id, 'runner_id' => 42, 'runner_name' => 'coolify-runner-done',
+        ]);
+        fakeRunnerStatusApi($this->githubApp, Http::response(['id' => 5001, 'status' => 'completed', 'conclusion' => 'success', 'runner_name' => $execution->runner_name]));
+
+        (new ReconcileGithubRunnersJob)->handle();
+
+        expect($execution->fresh()->status)->toBe(GithubRunnerStatus::Completed)
+            ->and($execution->fresh()->conclusion)->toBe('success')
+            ->and($execution->fresh()->error_message)->toBeNull();
+        Queue::assertPushed(CleanupGithubRunnerJob::class, fn ($job) => $job->executionId === $execution->id);
+    });
+
+    it('repairs mismatched failed rows from GitHub without deleting their history', function () {
+        Queue::fake();
+        Process::fake(['*' => Process::result(output: '')]);
+        $first = runnerTestExecution($this->githubApp, [
+            'trigger_workflow_job_id' => 5001, 'workflow_job_id' => 5001, 'repository_full_name' => 'acme/api', 'job_name' => 'first-job',
+            'status' => GithubRunnerStatus::Failed, 'server_id' => $this->server->id, 'runner_name' => 'coolify-runner-first',
+            'error_message' => 'The runner container stopped before GitHub reported a job result.',
+        ]);
+        $second = runnerTestExecution($this->githubApp, [
+            'trigger_workflow_job_id' => 6001, 'workflow_job_id' => 6001, 'repository_full_name' => 'acme/original', 'job_name' => 'second-job',
+            'status' => GithubRunnerStatus::Failed, 'server_id' => $this->server->id, 'runner_name' => 'coolify-runner-second',
+            'error_message' => 'The runner container stopped before GitHub reported a job result.',
+        ]);
+        fakeRunnerStatusApi($this->githubApp, Http::response(['id' => 5001, 'status' => 'completed', 'conclusion' => 'success', 'runner_name' => $second->runner_name]));
+        Http::fake(['https://api.github.com/repos/acme/original/actions/jobs/6001' => Http::response([
+            'id' => 6001, 'status' => 'completed', 'conclusion' => 'success', 'runner_name' => $first->runner_name,
+        ])]);
+
+        $this->artisan('github-runners:reconcile-results', ['githubAppId' => $this->githubApp->id, '--apply' => true])->assertSuccessful();
+
+        expect($first->fresh()->status)->toBe(GithubRunnerStatus::Completed)
+            ->and($first->fresh()->workflow_job_id)->toBe(6001)
+            ->and($first->fresh()->repository_full_name)->toBe('acme/original')
+            ->and($second->fresh()->status)->toBe(GithubRunnerStatus::Completed)
+            ->and($second->fresh()->workflow_job_id)->toBe(5001)
+            ->and($second->fresh()->repository_full_name)->toBe('acme/api')
+            ->and(GithubRunnerExecution::count())->toBe(2);
+    });
+
+    it('does not change historical rows during a dry run or incomplete verification', function () {
+        Queue::fake();
+        $first = runnerTestExecution($this->githubApp, [
+            'trigger_workflow_job_id' => 5001, 'workflow_job_id' => 5001, 'repository_full_name' => 'acme/api',
+            'status' => GithubRunnerStatus::Failed, 'runner_name' => 'coolify-runner-first',
+            'error_message' => 'The runner container stopped before GitHub reported a job result.',
+        ]);
+        fakeRunnerStatusApi($this->githubApp, Http::response(['id' => 5001, 'status' => 'completed', 'conclusion' => 'success', 'runner_name' => $first->runner_name]));
+        $this->artisan('github-runners:reconcile-results', ['githubAppId' => $this->githubApp->id])->assertSuccessful();
+        expect($first->fresh()->status)->toBe(GithubRunnerStatus::Failed);
+
+        $second = runnerTestExecution($this->githubApp, [
+            'workflow_job_id' => 6001, 'repository_full_name' => 'acme/original', 'status' => GithubRunnerStatus::Failed,
+            'error_message' => 'The runner container stopped before GitHub reported a job result.',
+        ]);
+        Http::fake(['https://api.github.com/repos/acme/original/actions/jobs/6001' => Http::response([], 503)]);
+        $this->artisan('github-runners:reconcile-results', ['githubAppId' => $this->githubApp->id, '--apply' => true])->assertFailed();
+        expect($first->fresh()->status)->toBe(GithubRunnerStatus::Failed)
+            ->and($second->fresh()->status)->toBe(GithubRunnerStatus::Failed);
+        Queue::assertNothingPushed();
+    });
+
+    it('preserves an operator cancellation during historical verification', function () {
+        Queue::fake();
+        $execution = runnerTestExecution($this->githubApp, [
+            'trigger_workflow_job_id' => 5001, 'workflow_job_id' => 5001, 'repository_full_name' => 'acme/api',
+            'status' => GithubRunnerStatus::Failed, 'runner_name' => 'coolify-runner-first',
+            'error_message' => 'The runner container stopped before GitHub reported a job result.',
+        ]);
+        fakeRunnerStatusApi($this->githubApp, function () use ($execution) {
+            $execution->update(['status' => GithubRunnerStatus::Cancelled]);
+
+            return Http::response(['id' => 5001, 'status' => 'completed', 'conclusion' => 'success', 'runner_name' => $execution->runner_name]);
+        });
+        $this->artisan('github-runners:reconcile-results', ['githubAppId' => $this->githubApp->id, '--apply' => true])->assertSuccessful();
+        expect($execution->fresh()->status)->toBe(GithubRunnerStatus::Cancelled);
+        Queue::assertNothingPushed();
+    });
+
+    it('recovers a missed started webhook before the idle timeout', function () {
+        Queue::fake();
+        $this->travelTo(now()->startOfSecond());
+        $execution = runnerTestExecution($this->githubApp, [
+            'trigger_workflow_job_id' => 5001, 'workflow_job_id' => 5001, 'repository_full_name' => 'acme/api',
+            'status' => GithubRunnerStatus::Idle, 'server_id' => $this->server->id,
+            'github_runner_config_id' => $this->config->id, 'runner_id' => 42, 'runner_name' => 'coolify-runner-busy',
+            'ready_at' => now()->subMinutes(11),
+        ]);
+        Process::fake(['*' => Process::result(output: "{$execution->uuid} coolify-runner-{$execution->uuid} running")]);
+        fakeRunnerStatusApi($this->githubApp, Http::response([
+            'id' => 5001, 'status' => 'in_progress', 'runner_name' => $execution->runner_name,
+            'started_at' => now()->subMinutes(11)->toIso8601String(),
+        ]), Http::response(['id' => 42, 'busy' => true]));
+
+        (new ReconcileGithubRunnersJob)->handle();
+
+        expect($execution->fresh()->status)->toBe(GithubRunnerStatus::Running)
+            ->and($execution->fresh()->started_at->equalTo(now()->subMinutes(11)))->toBeTrue();
+        Queue::assertNotPushed(CleanupGithubRunnerJob::class);
+    });
+
+    it('does not reap an apparently idle runner during an ambiguous GitHub response', function () {
+        Queue::fake();
+        $execution = runnerTestExecution($this->githubApp, [
+            'trigger_workflow_job_id' => 5001, 'workflow_job_id' => 5001, 'repository_full_name' => 'acme/api',
+            'status' => GithubRunnerStatus::Idle, 'server_id' => $this->server->id,
+            'github_runner_config_id' => $this->config->id, 'runner_id' => 42, 'ready_at' => now()->subMinutes(11),
+        ]);
+        Process::fake(['*' => Process::result(output: "{$execution->uuid} coolify-runner-{$execution->uuid} running")]);
+        fakeRunnerStatusApi($this->githubApp, Http::response(['message' => 'Unavailable'], 503), Http::response(['message' => 'Unavailable'], 503));
+
+        (new ReconcileGithubRunnersJob)->handle();
+
+        expect($execution->fresh()->status)->toBe(GithubRunnerStatus::Idle);
+        Queue::assertNotPushed(CleanupGithubRunnerJob::class);
+    });
+
+    it('still expires a confirmed unused runner and enforces the job deadline', function (GithubRunnerStatus $status, string $jobStatus, bool $busy, GithubRunnerStatus $expected) {
+        Queue::fake();
+        $this->travelTo(now()->startOfSecond());
+        $execution = runnerTestExecution($this->githubApp, [
+            'trigger_workflow_job_id' => 5001, 'workflow_job_id' => 5001, 'repository_full_name' => 'acme/api',
+            'status' => $status, 'server_id' => $this->server->id,
+            'github_runner_config_id' => $this->config->id, 'runner_id' => 42, 'runner_name' => 'coolify-runner-bounded',
+            'ready_at' => now()->subMinutes(61), 'started_at' => $status === GithubRunnerStatus::Running ? now()->subMinutes(61) : null,
+        ]);
+        Process::fake(['*' => Process::result(output: "{$execution->uuid} coolify-runner-{$execution->uuid} running")]);
+        fakeRunnerStatusApi($this->githubApp, $jobStatus === 'unavailable'
+            ? Http::response(['message' => 'Unavailable'], 503)
+            : Http::response(['id' => 5001, 'status' => $jobStatus, 'runner_name' => $busy ? $execution->runner_name : '']),
+            Http::response(['id' => 42, 'busy' => $busy]));
+
+        (new ReconcileGithubRunnersJob)->handle();
+
+        expect($execution->fresh()->status)->toBe($expected);
+        Queue::assertPushed(CleanupGithubRunnerJob::class, fn ($job) => $job->executionId === $execution->id);
+    })->with([
+        'genuinely idle' => [GithubRunnerStatus::Idle, 'queued', false, GithubRunnerStatus::Cancelled],
+        'busy beyond configured job limit' => [GithubRunnerStatus::Running, 'in_progress', true, GithubRunnerStatus::TimedOut],
+        'known deadline during GitHub outage' => [GithubRunnerStatus::Running, 'unavailable', true, GithubRunnerStatus::TimedOut],
+    ]);
+
+    it('recovers cross-assignment from GitHub when its started webhook was missed', function () {
+        Queue::fake();
+        $runner = runnerTestExecution($this->githubApp, [
+            'trigger_workflow_job_id' => 6001, 'workflow_job_id' => 6001, 'status' => GithubRunnerStatus::Idle,
+            'server_id' => $this->server->id, 'github_runner_config_id' => $this->config->id,
+            'runner_name' => 'coolify-runner-a', 'ready_at' => now(), 'job_name' => 'original', 'provision_attempts' => 1,
+        ]);
+        $queued = runnerTestExecution($this->githubApp, [
+            'trigger_workflow_job_id' => 5001, 'workflow_job_id' => 5001, 'repository_full_name' => 'acme/api', 'job_name' => 'actual',
+        ]);
+        Process::fake(['*' => Process::result(output: "{$runner->uuid} coolify-runner-{$runner->uuid} running")]);
+        fakeRunnerStatusApi($this->githubApp, Http::response(['id' => 5001, 'status' => 'in_progress', 'runner_name' => $runner->runner_name]));
+
+        (new ReconcileGithubRunnersJob)->handle();
+
+        expect($runner->fresh()->status)->toBe(GithubRunnerStatus::Running)
+            ->and($runner->fresh()->trigger_workflow_job_id)->toBe(5001)
+            ->and($runner->fresh()->repository_full_name)->toBe('acme/api')
+            ->and($runner->fresh()->job_name)->toBe('actual')
+            ->and($queued->fresh())->toBeNull();
+        $replacement = GithubRunnerExecution::where('trigger_workflow_job_id', 6001)->sole();
+        expect($replacement->status)->toBe(GithubRunnerStatus::Queued)->and($replacement->job_name)->toBe('original');
+        Queue::assertNotPushed(CleanupGithubRunnerJob::class);
+    });
+
+    it('does not overwrite operator cancellation while GitHub is being checked', function () {
+        Queue::fake();
+        $execution = runnerTestExecution($this->githubApp, [
+            'trigger_workflow_job_id' => 5001, 'workflow_job_id' => 5001, 'repository_full_name' => 'acme/api',
+            'status' => GithubRunnerStatus::Idle, 'server_id' => $this->server->id,
+            'github_runner_config_id' => $this->config->id, 'runner_id' => 42, 'ready_at' => now()->subMinutes(11),
+        ]);
+        Process::fake(['*' => Process::result(output: "{$execution->uuid} coolify-runner-{$execution->uuid} running")]);
+        fakeRunnerStatusApi($this->githubApp, function () use ($execution) {
+            $execution->finish(GithubRunnerStatus::Cancelled, 'Cancelled by an operator.');
+
+            return Http::response(['id' => 5001, 'status' => 'queued']);
+        });
+
+        (new ReconcileGithubRunnersJob)->handle();
+
+        expect($execution->fresh()->status)->toBe(GithubRunnerStatus::Cancelled)
+            ->and($execution->fresh()->error_message)->toBe('Cancelled by an operator.');
+        Queue::assertNotPushed(CleanupGithubRunnerJob::class);
     });
 
     it('times out queued jobs after the wait timeout and retries the others', function () {
