@@ -92,18 +92,22 @@ class GithubRunnerExecution extends BaseModel
     public function assignJob(int $jobId, array $jobDetails): ?self
     {
         $replacement = DB::transaction(function () use ($jobId, $jobDetails): ?self {
-            $execution = self::query()->whereKey($this->id)->lockForUpdate()->first();
+            $executions = self::query()
+                ->where('github_app_id', $this->github_app_id)
+                ->where(fn (Builder $query) => $query->whereKey($this->id)->orWhere('trigger_workflow_job_id', $jobId))
+                ->orderBy('id')
+                ->lockForUpdate()
+                ->get();
+            $execution = $executions->firstWhere('id', $this->id);
             if (! $execution || ! in_array($execution->status, [GithubRunnerStatus::Provisioning, GithubRunnerStatus::Idle], true)) {
                 return null;
             }
 
             $running = [...$jobDetails, 'workflow_job_id' => $jobId, 'status' => GithubRunnerStatus::Running, 'started_at' => now()];
-            $jobExecution = $execution->trigger_workflow_job_id === $jobId ? $execution : self::query()
-                ->where('github_app_id', $execution->github_app_id)
-                ->where('trigger_workflow_job_id', $jobId)
-                ->lockForUpdate()
-                ->first();
-            if ($jobExecution?->isActive()) {
+            $jobExecution = $executions->firstWhere('trigger_workflow_job_id', $jobId);
+            $unassigned = $jobExecution?->status === GithubRunnerStatus::Queued
+                && $jobExecution->server_id === null && $jobExecution->runner_name === null;
+            if ($jobExecution?->isActive() && ! $unassigned) {
                 $execution->update($running);
 
                 return null;
@@ -136,11 +140,30 @@ class GithubRunnerExecution extends BaseModel
                     && ($config->allow_pull_requests || ! $replacement['is_pull_request']));
 
             return $hasMatchingConfig ? self::create($replacement) : null;
-        });
+        }, attempts: 3);
 
         $this->refresh();
 
         return $replacement;
+    }
+
+    /**
+     * Retires only an unassigned queue entry. A provisioner or an operator that changed its state wins.
+     */
+    public static function finishUnassignedJob(int $githubAppId, int $jobId, ?string $conclusion, ?string $errorMessage = null): void
+    {
+        self::query()
+            ->where('github_app_id', $githubAppId)
+            ->where('trigger_workflow_job_id', $jobId)
+            ->where('status', GithubRunnerStatus::Queued)
+            ->whereNull('server_id')
+            ->whereNull('runner_name')
+            ->update([
+                'status' => $conclusion === null ? GithubRunnerStatus::Cancelled : GithubRunnerStatus::Completed,
+                'conclusion' => $conclusion,
+                'error_message' => $errorMessage,
+                'completed_at' => now(),
+            ]);
     }
 
     public function isActive(): bool

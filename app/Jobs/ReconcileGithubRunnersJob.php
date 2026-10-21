@@ -7,6 +7,7 @@ use App\Models\GithubRunnerConfig;
 use App\Models\GithubRunnerExecution;
 use App\Models\Server;
 use App\Services\GithubRunner\GithubRunnerContainer;
+use App\Services\GithubRunner\GithubRunnerStatusSync;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldBeUnique;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -86,9 +87,27 @@ class ReconcileGithubRunnersJob implements ShouldBeUnique, ShouldQueue
 
         foreach ($executions as $execution) {
             $failure = $this->failureFor($execution, $containers->get($execution->uuid, []));
+            if ($failure && $execution->runner_id) {
+                if (! GithubRunnerStatusSync::beforeCleanup($execution, $failure[0] === GithubRunnerStatus::TimedOut)) {
+                    continue;
+                }
+                if ($execution->status === GithubRunnerStatus::Completed) {
+                    CleanupGithubRunnerJob::dispatch($execution->id);
+
+                    continue;
+                }
+                if (! $execution->isActive()) {
+                    continue;
+                }
+                $failure = $this->failureFor($execution, $containers->get($execution->uuid, []));
+            }
             if ($failure) {
-                $execution->finish(...$failure);
-                CleanupGithubRunnerJob::dispatch($execution->id);
+                $finished = GithubRunnerExecution::query()->whereKey($execution->id)
+                    ->where('status', $execution->status)->where('workflow_job_id', $execution->workflow_job_id)
+                    ->update(['status' => $failure[0], 'error_message' => $failure[1], 'completed_at' => $execution->completed_at ?? now()]);
+                if ($finished) {
+                    CleanupGithubRunnerJob::dispatch($execution->id);
+                }
             }
         }
 
@@ -148,6 +167,10 @@ class ReconcileGithubRunnersJob implements ShouldBeUnique, ShouldQueue
 
     private function reconcileQueued(): void
     {
+        // Rotate a bounded set through GitHub so missed webhooks cannot leave completed jobs queued forever.
+        GithubRunnerExecution::query()->where('status', GithubRunnerStatus::Queued)
+            ->whereNotNull('repository_full_name')->orderBy('updated_at')->orderBy('id')->limit(10)->get()
+            ->each(fn (GithubRunnerExecution $execution) => GithubRunnerStatusSync::queued($execution));
         $queued = GithubRunnerExecution::query()
             ->where('status', GithubRunnerStatus::Queued)
             ->get()

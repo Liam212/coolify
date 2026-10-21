@@ -8,6 +8,7 @@ use App\Models\GithubRunnerExecution;
 use App\Models\Server;
 use App\Services\GithubRunner\GithubRunnerApi;
 use App\Services\GithubRunner\GithubRunnerContainer;
+use App\Services\GithubRunner\GithubRunnerStatusSync;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldBeEncrypted;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -59,6 +60,10 @@ class ProvisionGithubRunnerJob implements ShouldBeEncrypted, ShouldQueue
 
     public function handle(): void
     {
+        $pending = GithubRunnerExecution::find($this->executionId);
+        if (! $pending || ! GithubRunnerStatusSync::queued($pending)) {
+            return;
+        }
         $execution = $this->reserveServer();
         if (! $execution) {
             return;
