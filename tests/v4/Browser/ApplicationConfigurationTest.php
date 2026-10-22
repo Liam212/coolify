@@ -38,7 +38,7 @@ it('shows application configuration sections and navigation', function () {
         ->assertSee('Application details')
         ->assertSee('Internal access')
         ->assertSee('Docker network')
-        ->assertSee('Build pipeline')
+        ->assertSee('Build & deploy')
         ->screenshot(filename: 'application-configuration-overview');
 });
 
@@ -111,23 +111,33 @@ it('saves application name description and ports from the general form', functio
     $page->assertSee('General')
         ->fill('name', $updatedName)
         ->fill('description', 'Updated via browser test')
+        ->click('#internal-access-section button:has-text("Edit networking")')
         ->fill('portsExposes', '8080')
+        ->fill('customNetworkAliases', 'api.internal')
         ->screenshot(filename: 'application-general-before-save');
 
-    submitLivewireForm($page);
-
-    $page->assertValue('name', $updatedName)
+    $page->click('form button[type="submit"]:visible:has-text("Save")')
+        ->assertScript(<<<'JS'
+            () => [...document.querySelectorAll('#internal-access-section label')]
+                .find((label) => label.textContent.trim() === 'Network aliases')
+                ?.parentElement.querySelector('input')?.value === 'api.internal'
+            JS)
+        ->assertValue('name', $updatedName)
         ->assertScript(<<<'JS'
             () => [...document.querySelectorAll('#internal-access-section label')]
                 .find((label) => label.textContent.trim() === 'Exposed ports')
                 ?.parentElement.querySelector('input')?.value === '8080'
             JS)
+        ->wait(0.5)
+        ->assertScript("() => document.querySelector('input[name=portsExposes]')?.checkVisibility() === false")
+        ->assertNoJavaScriptErrors()
         ->screenshot(filename: 'application-general-after-save');
 
     $this->application->refresh();
     expect($this->application->name)->toBe($updatedName)
         ->and($this->application->description)->toBe('Updated via browser test')
-        ->and($this->application->ports_exposes)->toBe('8080');
+        ->and($this->application->ports_exposes)->toBe('8080')
+        ->and($this->application->custom_network_aliases)->toBe('api.internal');
 
     $reloaded = visit($url);
     $reloaded->assertValue('name', $updatedName)
@@ -192,6 +202,59 @@ it('saves custom docker run options from the UI', function () {
     $page->assertValue('customDockerRunOptions', $options)
         ->screenshot(filename: 'application-docker-run-options');
 });
+
+it('warns when the Dockerfile location repeats the base directory and applies the suggested fix', function () {
+    $this->application->update([
+        'build_pack' => 'dockerfile',
+        'base_directory' => '/apps/api',
+        'dockerfile_location' => '/apps/api/Dockerfile',
+    ]);
+
+    loginAndSkipBoarding();
+
+    $page = visit(applicationConfigurationUrl(
+        $this->stack['project'],
+        $this->stack['environment'],
+        $this->application
+    ));
+
+    $page->assertSee('Base directory is repeated')
+        ->assertSee('/apps/api/apps/api/Dockerfile')
+        ->screenshot(filename: 'application-dockerfile-location-repeats-base-directory')
+        ->click('Use /Dockerfile')
+        ->assertDontSee('Base directory is repeated')
+        ->assertSee('/apps/api/Dockerfile');
+
+    submitLivewireForm($page);
+
+    $page->assertNoJavaScriptErrors()
+        ->screenshot(filename: 'application-dockerfile-location-fixed');
+
+    $this->application->refresh();
+    expect($this->application->base_directory)->toBe('/apps/api')
+        ->and($this->application->dockerfile_location)->toBe('/Dockerfile');
+});
+
+it('restores the default file location when the field is cleared', function (string $buildPack, string $column, string $default) {
+    $this->application->update(['build_pack' => $buildPack, $column => '/docker/custom']);
+
+    loginAndSkipBoarding();
+
+    $page = visit(applicationConfigurationUrl(
+        $this->stack['project'],
+        $this->stack['environment'],
+        $this->application
+    ));
+
+    $page->clear("input[placeholder='{$default}']")
+        ->keys("input[placeholder='{$default}']", 'Tab')
+        ->assertValue("input[placeholder='{$default}']", $default)
+        ->assertNoJavaScriptErrors()
+        ->screenshot(filename: "application-{$buildPack}-location-cleared");
+})->with([
+    'Dockerfile' => ['dockerfile', 'dockerfile_location', '/Dockerfile'],
+    'Docker Compose' => ['dockercompose', 'docker_compose_location', '/docker-compose.yaml'],
+]);
 
 it('opens environment variables page for the application', function () {
     loginAndSkipBoarding();
