@@ -1,10 +1,10 @@
 # A bounded, reversible release of the runner fixes on the unchanged official platform image.
-ARG COOLIFY_BASE_IMAGE=coollabsio/coolify@sha256:df5d62a743dd0a786cb604a9550243ef5ca04f610056852aff8b69faa9a06698
+ARG COOLIFY_BASE_IMAGE=coollabsio/coolify@sha256:d96931bef961ab5c173edfca190e03d4b77e93dee622da780ddfa22cfa2b77cf
 FROM ${COOLIFY_BASE_IMAGE}
 ARG PATCH_REVISION
-LABEL io.worldsportsapi.runner-patch="LIA-379" \
+LABEL io.worldsportsapi.runner-patch="LIA-392" \
       io.worldsportsapi.runner-patch-revision="${PATCH_REVISION}" \
-      io.worldsportsapi.runner-patch-base="4.4.7"
+      io.worldsportsapi.runner-patch-base="4.5.0"
 COPY --chown=www-data:www-data app/Http/Controllers/Webhook/Github.php /var/www/html/app/Http/Controllers/Webhook/Github.php
 COPY --chown=www-data:www-data app/Jobs/ProvisionGithubRunnerJob.php /var/www/html/app/Jobs/ProvisionGithubRunnerJob.php
 COPY --chown=www-data:www-data app/Jobs/ReconcileGithubRunnersJob.php /var/www/html/app/Jobs/ReconcileGithubRunnersJob.php
