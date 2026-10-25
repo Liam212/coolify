@@ -345,6 +345,7 @@ class Github extends Controller
                     $execution->finish(GithubRunnerStatus::Completed);
                     CleanupGithubRunnerJob::dispatch($execution->id);
                 }
+                GithubRunnerExecution::finishUnassignedJob($githubApp->id, $jobId, $execution->conclusion);
 
                 return response('Runner cleanup queued.');
             }
